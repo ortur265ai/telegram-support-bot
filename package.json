@@ -1,0 +1,14 @@
+{
+  "name": "telegram-support-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "openai": "^4.28.0",
+    "pg": "^8.11.0",
+    "node-cron": "^3.0.3"
+  }
+}
