@@ -1,61 +1,69 @@
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
+const { Pool } = require('pg');
 const cron = require('node-cron');
 
 // Конфігурація
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID; // Твій Telegram ID
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// База даних
-const db = new sqlite3.Database('support_bot.db');
+// База даних PostgreSQL
+const pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
 
 // Ініціалізація таблиць
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        telegram_id INTEGER UNIQUE,
-        name TEXT,
-        stage TEXT DEFAULT 'знайомство',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP,
-        mood_score INTEGER DEFAULT 5,
-        settings TEXT DEFAULT '{}'
-    )`);
+async function initDatabase() {
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            stage TEXT DEFAULT 'знайомство',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            mood_score INTEGER DEFAULT 5,
+            settings JSONB DEFAULT '{}'
+        )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        message TEXT,
-        mood_score INTEGER,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        message_type TEXT DEFAULT 'user',
-        tags TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-    )`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            message TEXT,
+            mood_score INTEGER,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_type TEXT DEFAULT 'user',
+            tags TEXT
+        )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS achievements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        title TEXT,
-        description TEXT,
-        date DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-    )`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS achievements (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            title TEXT,
+            description TEXT,
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS mood_patterns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        date DATE,
-        morning_mood INTEGER,
-        evening_mood INTEGER,
-        notes TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-    )`);
-});
+        await pool.query(`CREATE TABLE IF NOT EXISTS mood_patterns (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            date DATE,
+            morning_mood INTEGER,
+            evening_mood INTEGER,
+            notes TEXT
+        )`);
+
+        console.log('🗄️ База даних ініціалізована');
+    } catch (error) {
+        console.error('Помилка ініціалізації БД:', error);
+    }
+}
 
 class SupportBot {
     constructor() {
@@ -69,22 +77,16 @@ class SupportBot {
     }
 
     setupHandlers() {
-        // Команди
         bot.onText(/\/start/, (msg) => this.handleStart(msg));
         bot.onText(/\/mood/, (msg) => this.handleMoodCheck(msg));
         bot.onText(/\/sos/, (msg) => this.handleSOS(msg));
-        bot.onText(/\/achievements/, (msg) => this.showAchievements(msg));
-        bot.onText(/\/stats/, (msg) => this.showStats(msg));
-        bot.onText(/\/settings/, (msg) => this.showSettings(msg));
 
-        // Обробка всіх повідомлень
         bot.on('message', (msg) => {
             if (!msg.text.startsWith('/')) {
                 this.handleMessage(msg);
             }
         });
 
-        // Callback кнопки
         bot.on('callback_query', (query) => this.handleCallback(query));
     }
 
@@ -92,11 +94,12 @@ class SupportBot {
         const userId = msg.from.id;
         const userName = msg.from.first_name || 'Друже';
 
-        // Реєстрація користувача
-        db.run(`INSERT OR REPLACE INTO users (telegram_id, name) VALUES (?, ?)`, 
-            [userId, userName]);
+        try {
+            await pool.query(`INSERT INTO users (telegram_id, name) VALUES ($1, $2) 
+                             ON CONFLICT (telegram_id) DO UPDATE SET name = $2`, 
+                [userId, userName]);
 
-        const welcomeMessage = `Привіт, ${userName}! 👋
+            const welcomeMessage = `Привіт, ${userName}! 👋
 
 Я твій персональний бот-помічник для емоційної підтримки. Я буду:
 
@@ -109,48 +112,46 @@ class SupportBot {
 Доступні команди:
 /mood - перевірити настрій
 /sos - екстрена підтримка
-/achievements - твої досягнення
-/stats - статистика настрою
-/settings - налаштування
 
 Розкажи мені про себе - що зараз відбувається в твоєму житті?`;
 
-        bot.sendMessage(userId, welcomeMessage);
+            bot.sendMessage(userId, welcomeMessage);
+        } catch (error) {
+            console.error('Помилка реєстрації користувача:', error);
+            bot.sendMessage(userId, 'Вибач, сталася помилка. Спробуй ще раз.');
+        }
     }
 
     async handleMessage(msg) {
         const userId = msg.from.id;
         const messageText = msg.text;
         
-        // Аналіз настрою
-        const moodScore = this.analyzeMood(messageText);
-        
-        // Збереження повідомлення
-        db.run(`INSERT INTO messages (user_id, message, mood_score) VALUES (?, ?, ?)`,
-            [userId, messageText, moodScore]);
+        try {
+            const moodScore = this.analyzeMood(messageText);
+            
+            await pool.query(`INSERT INTO messages (user_id, message, mood_score) VALUES ($1, $2, $3)`,
+                [userId, messageText, moodScore]);
 
-        // Оновлення користувача
-        db.run(`UPDATE users SET last_interaction = CURRENT_TIMESTAMP, mood_score = ? WHERE telegram_id = ?`,
-            [moodScore, userId]);
+            await pool.query(`UPDATE users SET last_interaction = CURRENT_TIMESTAMP, mood_score = $1 WHERE telegram_id = $2`,
+                [moodScore, userId]);
 
-        // Генерація відповіді
-        const response = await this.generateResponse(userId, messageText, moodScore);
-        bot.sendMessage(userId, response);
+            const response = await this.generateResponse(userId, messageText, moodScore);
+            bot.sendMessage(userId, response);
 
-        // Перевірка на досягнення
-        this.checkForAchievements(userId, messageText);
+        } catch (error) {
+            console.error('Помилка обробки повідомлення:', error);
+            bot.sendMessage(userId, 'Вибач, сталася помилка. Але я тут і готовий тебе вислухати! Спробуй ще раз.');
+        }
     }
 
     analyzeMood(text) {
         const lowerText = text.toLowerCase();
-        let score = 5; // нейтральний
+        let score = 5;
 
-        // Позитивні маркери
         this.moodKeywords.positive.forEach(word => {
             if (lowerText.includes(word)) score += 1;
         });
 
-        // Негативні маркери  
         this.moodKeywords.negative.forEach(word => {
             if (lowerText.includes(word)) score -= 1;
         });
@@ -159,20 +160,14 @@ class SupportBot {
     }
 
     async generateResponse(userId, message, moodScore) {
-        // Отримання контексту користувача
-        const context = await this.getUserContext(userId);
-        
-        const prompt = `Ти емоційний помічник українською мовою. 
-
-Контекст користувача: ${JSON.stringify(context)}
-Поточний настрій (1-10): ${moodScore}
-Останнє повідомлення: "${message}"
-
-Відповідай тепло, підтримуюче, пам'ятай попередні розмови. Якщо настрій низький (1-4) - надавай більше підтримки. Якщо високий (8-10) - святкуй разом.
-
-Відповідь має бути 2-3 речення, щира та персоналізована.`;
-
         try {
+            const prompt = `Ти емоційний помічник українською мовою. 
+Настрій користувача (1-10): ${moodScore}
+Повідомлення: "${message}"
+
+Відповідай тепло, підтримуюче. Якщо настрій низький (1-4) - надавай більше підтримки. 
+Відповідь має бути 2-3 речення.`;
+
             const completion = await openai.chat.completions.create({
                 model: "gpt-4o-mini",
                 messages: [{ role: "user", content: prompt }],
@@ -189,34 +184,12 @@ class SupportBot {
 
     getFallbackResponse(moodScore) {
         if (moodScore <= 3) {
-            return "Розумію, що зараз важко. Я тут і готовий підтримати тебе. Хочеш поговорити про це детальніше? 💙";
+            return "Розумію, що зараз важко. Я тут і готовий підтримати тебе. Хочеш поговорити про це детальніше?";
         } else if (moodScore >= 8) {
-            return "Чудово чути такі позитивні новини! Продовжуй в тому ж дусі! 🌟";
+            return "Чудово чути такі позитивні новини! Продовжуй в тому ж дусі!";
         } else {
-            return "Дякую за те, що поділився. Я завжди готовий вислухати і підтримати 🤗";
+            return "Дякую за те, що поділився. Я завжди готовий вислухати і підтримати";
         }
-    }
-
-    async getUserContext(userId) {
-        return new Promise((resolve) => {
-            db.get(`SELECT * FROM users WHERE telegram_id = ?`, [userId], (err, user) => {
-                if (err) {
-                    resolve({});
-                    return;
-                }
-
-                db.all(`SELECT message, mood_score, timestamp FROM messages 
-                        WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10`, 
-                    [userId], (err, messages) => {
-                    
-                    resolve({
-                        stage: user?.stage || 'знайомство',
-                        lastMood: user?.mood_score || 5,
-                        recentMessages: messages || []
-                    });
-                });
-            });
-        });
     }
 
     async handleSOS(msg) {
@@ -240,15 +213,7 @@ class SupportBot {
 
 Хочеш поговорити про те, що зараз відбувається?`;
 
-        const keyboard = {
-            inline_keyboard: [
-                [{ text: "Так, давай поговоримо", callback_data: "talk_sos" }],
-                [{ text: "Покажи мої досягнення", callback_data: "show_achievements" }],
-                [{ text: "Включи режим підтримки", callback_data: "support_mode" }]
-            ]
-        };
-
-        bot.sendMessage(userId, sosMessage, { reply_markup: keyboard });
+        bot.sendMessage(userId, sosMessage);
     }
 
     async handleMoodCheck(msg) {
@@ -282,68 +247,46 @@ class SupportBot {
         const userId = query.from.id;
         const data = query.data;
 
-        if (data.startsWith('mood_')) {
-            const mood = parseInt(data.split('_')[1]);
-            db.run(`UPDATE users SET mood_score = ? WHERE telegram_id = ?`, [mood, userId]);
-            
-            let response = `Записав твій настрій: ${mood}/10`;
-            if (mood <= 3) {
-                response += "\n\nХочеш поговорити про те, що турбує? Я тут для тебе 💙";
-            } else if (mood >= 8) {
-                response += "\n\nВідмінно! Радію разом з тобою! 🎉";
+        try {
+            if (data.startsWith('mood_')) {
+                const mood = parseInt(data.split('_')[1]);
+                await pool.query(`UPDATE users SET mood_score = $1 WHERE telegram_id = $2`, [mood, userId]);
+                
+                let response = `Записав твій настрій: ${mood}/10`;
+                if (mood <= 3) {
+                    response += "\n\nХочеш поговорити про те, що турбує? Я тут для тебе";
+                } else if (mood >= 8) {
+                    response += "\n\nВідмінно! Радію разом з тобою!";
+                }
+                
+                bot.editMessageText(response, {
+                    chat_id: userId,
+                    message_id: query.message.message_id
+                });
             }
-            
-            bot.editMessageText(response, {
-                chat_id: userId,
-                message_id: query.message.message_id
-            });
+
+            bot.answerCallbackQuery(query.id);
+        } catch (error) {
+            console.error('Помилка callback:', error);
+            bot.answerCallbackQuery(query.id, { text: 'Сталася помилка, спробуй ще раз' });
         }
-
-        // Інші callback handlers...
-        bot.answerCallbackQuery(query.id);
-    }
-
-    checkForAchievements(userId, message) {
-        // Детекція досягнень
-        const achievements = [];
-        const lowerMessage = message.toLowerCase();
-
-        if (lowerMessage.includes('закінчив') || lowerMessage.includes('завершив')) {
-            achievements.push({ title: "Завершувач", description: "Довів справу до кінця!" });
-        }
-        
-        if (lowerMessage.includes('навчився') || lowerMessage.includes('вивчив')) {
-            achievements.push({ title: "Студент життя", description: "Освоїв щось нове!" });
-        }
-
-        achievements.forEach(achievement => {
-            db.run(`INSERT INTO achievements (user_id, title, description) VALUES (?, ?, ?)`,
-                [userId, achievement.title, achievement.description]);
-            
-            bot.sendMessage(userId, `🏆 Нове досягнення: "${achievement.title}"!\n${achievement.description}`);
-        });
     }
 
     startCronJobs() {
-        // Ранковий check-in (9:00)
         cron.schedule('0 9 * * *', () => {
             this.sendMorningCheckin();
         });
 
-        // Вечірня рефлексія (21:00)
         cron.schedule('0 21 * * *', () => {
             this.sendEveningReflection();
-        });
-
-        // Тижневий аналіз (неділя 19:00)
-        cron.schedule('0 19 * * 0', () => {
-            this.sendWeeklyAnalysis();
         });
     }
 
     async sendMorningCheckin() {
-        db.all(`SELECT telegram_id, name FROM users WHERE telegram_id = ?`, [ADMIN_USER_ID], (err, users) => {
-            users.forEach(user => {
+        try {
+            const result = await pool.query(`SELECT telegram_id, name FROM users WHERE telegram_id = $1`, [ADMIN_USER_ID]);
+            
+            result.rows.forEach(user => {
                 const messages = [
                     `Доброго ранку! ☀️ Як плани на сьогодні?`,
                     `Привіт! 🌅 Що хорошого сподіваєшся сьогодні?`,
@@ -353,24 +296,21 @@ class SupportBot {
                 const randomMessage = messages[Math.floor(Math.random() * messages.length)];
                 bot.sendMessage(user.telegram_id, randomMessage);
             });
-        });
+        } catch (error) {
+            console.error('Помилка ранкового повідомлення:', error);
+        }
     }
 
     async sendEveningReflection() {
-        db.all(`SELECT telegram_id, name FROM users WHERE telegram_id = ?`, [ADMIN_USER_ID], (err, users) => {
-            users.forEach(user => {
-                const keyboard = {
-                    inline_keyboard: [
-                        [{ text: "Поділитись днем", callback_data: "share_day" }],
-                        [{ text: "Оцінити настрій", callback_data: "rate_mood" }]
-                    ]
-                };
-
-                bot.sendMessage(user.telegram_id, 
-                    "Як пройшов день? 🌙 Готовий підвести підсумки?", 
-                    { reply_markup: keyboard });
+        try {
+            const result = await pool.query(`SELECT telegram_id, name FROM users WHERE telegram_id = $1`, [ADMIN_USER_ID]);
+            
+            result.rows.forEach(user => {
+                bot.sendMessage(user.telegram_id, "Як пройшов день? 🌙 Готовий підвести підсумки?");
             });
-        });
+        } catch (error) {
+            console.error('Помилка вечірнього повідомлення:', error);
+        }
     }
 }
 
@@ -383,7 +323,6 @@ async function startBot() {
 
 startBot().catch(console.error);
 
-// Обробка помилок
 process.on('unhandledRejection', (err) => {
     console.error('Unhandled Promise Rejection:', err);
 });
@@ -392,5 +331,3 @@ process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception:', err);
     process.exit(1);
 });
-
-module.exports = { SupportBot, bot, pool };
