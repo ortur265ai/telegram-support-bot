@@ -1,8 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
-const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
-const fs = require('fs');
 
 // Конфігурація
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
